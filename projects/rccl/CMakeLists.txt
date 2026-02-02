@@ -44,6 +44,9 @@ option(TRACE                                   "Enable additional tracing"      
 option(FAULT_INJECTION                         "Enable fault injection"                        ON)
 option(QUIET_WARNINGS                          "Supress compiler warnings"                     OFF)
 option(ENABLE_ROCSHMEM                         "Enable rocSHMEM support in RCCL"               OFF)
+option(ENABLE_AMDSMI                           "Enable AMD/ROCm SMI support"                   ON)
+
+
 
 # Default GPU architectures to build
 #==================================================================================================
@@ -58,7 +61,8 @@ set(DEFAULT_GPUS
       gfx1101
       gfx1102
       gfx1200
-      gfx1201)
+      gfx1201
+      gfx1151)
 
 # Load CMake modules
 #==================================================================================================
@@ -117,7 +121,21 @@ else()
 endif()
 
 set(GPU_TARGETS "${SUPPORTED_GPUS}")
+set(GPU_TARGETS "${SUPPORTED_GPUS}")
 message(STATUS "Compiling for ${GPU_TARGETS}")
+
+# Auto-disable SMI for gfx1151 as it is not supported
+if("${GPU_TARGETS}" MATCHES "gfx1151")
+  message(STATUS "Detected gfx1151 target: Forcing ENABLE_AMDSMI=OFF")
+  set(ENABLE_AMDSMI OFF CACHE BOOL "Force disable SMI for gfx1151" FORCE)
+endif()
+
+if(ENABLE_AMDSMI)
+  message(STATUS "SMI Support: ENABLED")
+  add_compile_definitions(RCCL_SMI_ENABLED)
+else()
+  message(STATUS "SMI Support: DISABLED")
+endif()
 
 ## NOTE: Reload rocm-cmake in order to update GPU_TARGETS
 include(cmake/Dependencies.cmake) # Reloading to use desired GPU_TARGETS instead of defaults
@@ -264,7 +282,7 @@ get_target_property(HSA_INCLUDE_PATH hsa-runtime64::hsa-runtime64 INTERFACE_INCL
 message(STATUS "HSA runtime: ${HSA_INCLUDE_PATH}")
 
 ## Check for amd-smi if ROCm 7.11.0 or newer
-if(ROCM_VERSION VERSION_GREATER_EQUAL "71100")
+if(ROCM_VERSION VERSION_GREATER_EQUAL "71100" AND ENABLE_AMDSMI)
   find_package(amd_smi PATHS ${ROCM_PATH}/lib/cmake/amd_smi)
   if(amd_smi_FOUND)
     message(STATUS "amd_smi_INCLUDE_DIR: ${amd_smi_INCLUDE_DIR}")
@@ -281,38 +299,7 @@ if(ROCM_VERSION VERSION_GREATER_EQUAL "71100")
   endif()
 endif()
 
-if(NOT USE_AMDSMI)
-  ## Fallback to rocm-smi if amd-smi not found or ROCm < 7.11.0
-  message(WARNING "Could not find amd_smi. Falling back to rocm_smi.")
-  find_package(rocm_smi PATHS ${ROCM_PATH}/lib/cmake/rocm_smi)
-  if(rocm_smi_FOUND)
-    set(SMI_INCLUDE_DIR "${rocm_smi_INCLUDE_DIR}" CACHE INTERNAL "rocm-smi include directory")
-    set(SMI_LIB_DIR "${rocm_smi_LIB_DIR}" CACHE INTERNAL "rocm-smi library directory")
-  else()
-    message(WARNING "CMake could not find rocm-smi. Checking old include directory structure for rocm_smi")
-    set(SMI_INCLUDE_DIR "${ROCM_PATH}/rocm_smi/include")
-    set(SMI_LIB_DIR     "${ROCM_PATH}/rocm_smi/lib")
-  endif()
 
-  if(NOT EXISTS "${SMI_INCLUDE_DIR}" OR NOT EXISTS "${SMI_LIB_DIR}")
-    message(FATAL_ERROR "rocm_smi not found in ${SMI_INCLUDE_DIR}")
-  endif()
-  message(STATUS "Found rocm_smi at ${SMI_INCLUDE_DIR}")
-  set(SMI_LIB_NAME "rocm-smi-lib" CACHE INTERNAL "rocm-smi-lib for packaging")
-  set(SMI_LIBRARIES rocm_smi64)
-
-  check_include_file_cxx("${SMI_INCLUDE_DIR}/rocm_smi/rocm_smi64Config.h" HAVE_ROCM_SMI64CONFIG)
-
-  ### Check for RSMI_INIT_FLAG_THRAD_ONLY_MUTEX support
-  file(READ "${SMI_INCLUDE_DIR}/rocm_smi/rocm_smi.h" rocm_smi_incl)
-  string(FIND "${rocm_smi_incl}" "RSMI_INIT_FLAG_THRAD_ONLY_MUTEX" matchres)
-  if(${matchres} EQUAL -1)
-    message(STATUS "RSMI_INIT_FLAG_THRAD_ONLY_MUTEX not supported")
-  else()
-    message(STATUS "RSMI_INIT_FLAG_THRAD_ONLY_MUTEX supported")
-    set(HAVE_ROCM_SMI_THREAD_ONLY_MUTEX True)
-  endif ()
-endif()
 
 ## Check for BFD library if custom backtrace is requested
 if(BUILD_BFD)
@@ -792,16 +779,26 @@ set(SRC_FILES
   src/misc/latency_profiler/CollTraceUtils.cc
 )
 
-if(USE_AMDSMI)
-  set(SMI_SOURCES
-    src/include/amdsmi_wrap.h
-    src/misc/amdsmi_wrap.cc
-  )
+# Unconditionally include SMI headers so they are hipified/available
+set(SMI_HEADERS
+  src/include/rocm_smi_wrap.h
+  src/include/amdsmi_wrap.h
+)
+list(APPEND SRC_FILES ${SMI_HEADERS})
+
+if(ENABLE_AMDSMI)
+  # Only compile the wrapper sources if SMI is enabled
+  if(USE_AMDSMI)
+     list(APPEND SRC_FILES src/misc/amdsmi_wrap.cc)
+  else()
+     list(APPEND SRC_FILES src/misc/rocm_smi_wrap.cc)
+  endif()
 else()
-  set(SMI_SOURCES
-    src/include/rocm_smi_wrap.h
-    src/misc/rocm_smi_wrap.cc
-  )
+  # When SMI is disabled, compile the shim to provide dummy symbols (rsmi_init)
+  # This satisfies external dependencies (like PyTorch) that expect SMI symbols
+  # to be present, preventing them from failing to load or trying to load
+  # the broken system library.
+  list(APPEND SRC_FILES src/misc/smi_shim.cc)
 endif()
 list(APPEND SRC_FILES ${SMI_SOURCES})
 
@@ -1206,12 +1203,12 @@ if (HAVE_PARALLEL_JOBS)
   target_compile_options(rccl PRIVATE -parallel-jobs=12)
 endif()
 
-if (ROCM_VERSION VERSION_GREATER_EQUAL "60200")
+if (ROCM_VERSION VERSION_GREATER_EQUAL "60200" AND NOT NO_COMPRESS)
   target_compile_options(rccl PRIVATE --offload-compress)    # Compress GPU code at compile time.
   target_link_libraries(rccl PRIVATE --offload-compress)     # Compress GPU code at link time.
   message(STATUS "--offload-compress enabled - ROCm version >= 6.2.0")
 else()
-  message(STATUS "--offload-compress disabled - ROCm version < 6.2.0")
+  message(STATUS "--offload-compress disabled (ROCM < 6.2.0 or NO_COMPRESS=ON)")
 endif()
 
 target_compile_options(rccl PRIVATE -Werror=uninitialized)
